@@ -14,12 +14,14 @@ from mmdet.models.builder import HEADS, build_loss
 
 from .base.mmdet_utils import (sample_valid_coords_with_frequencies,
                           get_uncertain_point_coords_3d_with_frequency,
-                          preprocess_occupancy_gt, point_sample_3d)
+                          preprocess_occupancy_gt, point_sample_3d, 
+                          get_point_coords_3d_with_frequency)
 
 from .base.anchor_free_head import AnchorFreeHead
 from .base.maskformer_head import MaskFormerHead
 from projects.mmdet3d_plugin.utils.semkitti import semantic_kitti_class_frequencies
 import pdb
+from .losses import DiceLoss
 
 
 # Mask2former for 3D Occupancy Segmentation
@@ -76,12 +78,17 @@ class Mask2FormerOccHead(MaskFormerHead):
                  loss_cls=None,
                  loss_mask=None,
                  loss_dice=None,
+                 loss_metric=None,
                  train_cfg=None,
                  test_cfg=None,
                  init_cfg=None,
+                 logit_norm=True,
+                 max_t = 1,
                  **kwargs):
         super(AnchorFreeHead, self).__init__(init_cfg)
         
+        self.logit_norm = logit_norm
+        self.max_t = max_t
         self.num_occupancy_classes = num_occupancy_classes
         self.num_classes = self.num_occupancy_classes
         self.num_queries = num_queries
@@ -115,6 +122,13 @@ class Mask2FormerOccHead(MaskFormerHead):
 
         ''' Pixel Decoder Related, skipped '''
         self.cls_embed = nn.Linear(feat_channels, self.num_classes + 1)
+
+        # probablistic model for pixel decoder
+        self.mu_head = nn.Sequential(nn.Conv1d(feat_channels, feat_channels, kernel_size=1, stride=1, bias=True), nn.ReLU(inplace=True), 
+                                    nn.Conv1d(feat_channels, feat_channels, kernel_size=1, stride=1, bias=True))
+        self.sigma_head = nn.Sequential(nn.Conv1d(feat_channels, feat_channels//2, kernel_size=1, stride=1, bias=True), nn.ReLU(inplace=True), 
+                                    nn.Conv1d(feat_channels//2, 1, kernel_size=1, stride=1, bias=True))
+
         self.mask_embed = nn.Sequential(
             nn.Linear(feat_channels, feat_channels), nn.ReLU(inplace=True),
             nn.Linear(feat_channels, feat_channels), nn.ReLU(inplace=True),
@@ -150,6 +164,7 @@ class Mask2FormerOccHead(MaskFormerHead):
         self.loss_cls = build_loss(loss_cls)
         self.loss_mask = build_loss(loss_mask)
         self.loss_dice = build_loss(loss_dice)
+        self.loss_metric = build_loss(loss_metric)
         self.pooling_attn_mask = pooling_attn_mask
         
         # align_corners
@@ -290,9 +305,9 @@ class Mask2FormerOccHead(MaskFormerHead):
         
         return (labels, label_weights, mask_targets, mask_weights, pos_inds, neg_inds)
     
-    @force_fp32(apply_to=('all_cls_scores', 'all_mask_preds'))
+    @force_fp32(apply_to=('all_cls_scores', 'all_mask_preds', 'all_sigma'))
     def loss(self, all_cls_scores, all_mask_preds, gt_labels_list,
-                gt_masks_list, img_metas):
+                gt_masks_list, all_sigma, img_metas):
         """Loss function.
 
         Args:
@@ -317,29 +332,31 @@ class Mask2FormerOccHead(MaskFormerHead):
         all_gt_masks_list = [gt_masks_list for _ in range(num_dec_layers)]
         img_metas_list = [img_metas for _ in range(num_dec_layers)]
         
-        losses_cls, losses_mask, losses_dice = multi_apply(
+        losses_cls, losses_mask, losses_dice, losses_metric = multi_apply(
             self.loss_single, all_cls_scores, all_mask_preds,
-            all_gt_labels_list, all_gt_masks_list, img_metas_list)
+            all_gt_labels_list, all_gt_masks_list, all_sigma, img_metas_list)
         
         loss_dict = dict()
         # loss from the last decoder layer
         loss_dict['loss_cls'] = losses_cls[-1]
         loss_dict['loss_mask'] = losses_mask[-1]
         loss_dict['loss_dice'] = losses_dice[-1]
-        
+        loss_dict['loss_metric'] = losses_metric[-1]
         # loss from other decoder layers
         num_dec_layer = 0
-        for loss_cls_i, loss_mask_i, loss_dice_i in zip(
-                losses_cls[:-1], losses_mask[:-1], losses_dice[:-1]):
+        for loss_cls_i, loss_mask_i, loss_dice_i, loss_metric_i in zip(
+                losses_cls[:-1], losses_mask[:-1], losses_dice[:-1], losses_metric[:-1]):
             loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
             loss_dict[f'd{num_dec_layer}.loss_mask'] = loss_mask_i
             loss_dict[f'd{num_dec_layer}.loss_dice'] = loss_dice_i
+            loss_dict[f'd{num_dec_layer}.loss_metric'] = loss_metric_i
+            
             num_dec_layer += 1
         
         return loss_dict
 
     def loss_single(self, cls_scores, mask_preds, gt_labels_list,
-                    gt_masks_list, img_metas):
+                    gt_masks_list, sigma, img_metas):
         """Loss function for outputs from a single decoder layer.
 
         Args:
@@ -374,9 +391,9 @@ class Mask2FormerOccHead(MaskFormerHead):
         label_weights = torch.stack(label_weights_list, dim=0)
         # shape (num_total_gts, h, w)
         mask_targets = torch.cat(mask_targets_list, dim=0)
+        # print(f"mask_targets: {mask_targets.shape}")
         # shape (batch_size, num_queries)
         mask_weights = torch.stack(mask_weights_list, dim=0)
-
         # classfication loss
         # shape (batch_size * num_queries, )
         cls_scores = cls_scores.flatten(0, 1)
@@ -392,15 +409,18 @@ class Mask2FormerOccHead(MaskFormerHead):
         )
 
         # extract positive ones
-        # shape (batch_size, num_queries, h, w) -> (num_total_gts, h, w)
+        # shape (batch_size, num_queries, x, y, z) -> (num_total_gts, x, y, z)
         mask_preds = mask_preds[mask_weights > 0]
+        sigma = sigma[mask_weights > 0] # shape (num_total_gts, 1)
         mask_weights = mask_weights[mask_weights > 0]
         
         if mask_targets.shape[0] == 0:
             # zero match
+            loss_metric = mask_preds.sum()
             loss_dice = mask_preds.sum()
             loss_mask = mask_preds.sum()
-            return loss_cls, loss_mask, loss_dice
+            
+            return loss_cls, loss_mask, loss_dice, loss_metric
 
         ''' 
         randomly sample K points for supervision, which can largely improve the 
@@ -412,7 +432,7 @@ class Mask2FormerOccHead(MaskFormerHead):
                 mask_preds.unsqueeze(1), None, gt_labels_list, gt_masks_list, 
                 self.sample_weights, self.num_points, self.oversample_ratio, 
                 self.importance_sample_ratio)
-            
+                   
             # shape (num_total_gts, h, w) -> (num_total_gts, num_points)
             mask_point_targets = torch.gather(mask_targets.view(mask_targets.shape[0], -1), 
                                         dim=1, index=point_indices)
@@ -425,7 +445,8 @@ class Mask2FormerOccHead(MaskFormerHead):
         num_total_mask_weights = reduce_mean(mask_weights.sum())
         loss_dice = self.loss_dice(mask_point_preds, mask_point_targets, 
                         weight=mask_weights, avg_factor=num_total_mask_weights)
-
+        
+        loss_metric = self.loss_metric(mask_point_preds, sigma, mask_point_targets, point_coords[0].unsqueeze(0))
         # mask loss
         # shape (num_queries, num_points) -> (num_queries * num_points, )
         mask_point_preds = mask_point_preds.reshape(-1)
@@ -441,7 +462,20 @@ class Mask2FormerOccHead(MaskFormerHead):
             weight=mask_point_weights,
             avg_factor=num_total_mask_point_weights)
 
-        return loss_cls, loss_mask, loss_dice
+        # with torch.no_grad():
+        #     pt_indices, pt_coords = get_point_coords_3d_with_frequency(gt_labels_list, gt_masks_list, 
+        #         self.sample_weights, self.num_points, self.oversample_ratio, 
+        #         self.importance_sample_ratio)
+            
+        #     mask_point_targets = torch.gather(mask_targets.view(mask_targets.shape[0], -1), 
+        #                     dim=1, index=pt_indices)
+        
+        # mask_point_preds = point_sample_3d(
+        #     mask_preds.unsqueeze(1), pt_coords[..., [2, 1, 0]], align_corners=self.align_corners).squeeze(1)
+        
+        # ## Metric loss
+        # loss_metric = self.loss_metric(mask_point_preds, sigma, mask_point_targets, pt_coords[0].unsqueeze(0))
+        return loss_cls, loss_mask, loss_dice, loss_metric
 
     def forward_head(self, decoder_out, mask_feature, attn_mask_target_size):
         """Forward for head part which is called after every decoder layer.
@@ -463,17 +497,35 @@ class Mask2FormerOccHead(MaskFormerHead):
             - attn_mask (Tensor): Attention mask in shape \
                 (batch_size * num_heads, num_queries, h, w).
         """
-        decoder_out = self.transformer_decoder.post_norm(decoder_out)
-        decoder_out = decoder_out.transpose(0, 1)
-        # shape (batch_size, num_queries, c)
-        cls_pred = self.cls_embed(decoder_out)
+        decoder_out = self.transformer_decoder.post_norm(decoder_out) 
+        decoder_out = decoder_out.transpose(0, 1) # [1, 100, 192] (N, Q, C)
+        # shape (batch_size, num_queries, c) 
+        # probablistic model
+        # TODO:  (to support sampling for cls loss)
+        emb_mu = self.mu_head(decoder_out.transpose(-1, -2)).transpose(-1, -2)  # ([N, Q, C])
+        emb_sigma = self.sigma_head(decoder_out.transpose(-1, -2)).transpose(-1, -2) # ([N, Q, 1])
+
+        if self.logit_norm:
+            emb_mu = emb_mu / torch.norm(emb_mu, dim=-1, p=2, keepdim=True) 
+        else:
+            # pass through a ReLU
+            emb_mu = F.relu(emb_mu)
+        # pass through a softplus
+        emb_sigma = F.softplus(emb_sigma)
+        if self.max_t > 0:
+            emb = self.reparam_trick(emb_mu, emb_sigma)  #([m * N, Q, C])
+        else: 
+            emb = emb_mu # ([N, Q, C])
+        cls_pred = torch.zeros(emb.shape[0], emb.shape[1], self.num_classes + 1).to(emb.device)
+        for i in range(emb.shape[0]):
+            cls_pred[i] = self.cls_embed(emb[i])
+        
         # shape (batch_size, num_queries, c)
         mask_embed = self.mask_embed(decoder_out)
         # shape (batch_size, num_queries, h, w)
         mask_pred = torch.einsum('bqc,bcxyz->bqxyz', mask_embed, mask_feature)
         
         ''' 对于一些样本数量较少的类别来说，经过 trilinear 插值 + 0.5 阈值，正样本直接消失 '''
-        
         if self.pooling_attn_mask:
             # however, using max-pooling can save more positive samples, which is quite important for rare classes
             attn_mask = F.adaptive_max_pool3d(mask_pred.float(), attn_mask_target_size)
@@ -488,7 +540,21 @@ class Mask2FormerOccHead(MaskFormerHead):
         # repeat for the num_head axis, (batch_size, num_queries, num_seq) -> (batch_size * num_head, num_queries, num_seq)
         attn_mask = attn_mask.unsqueeze(1).repeat((1, self.num_heads, 1, 1)).flatten(0, 1)
 
-        return cls_pred, mask_pred, attn_mask
+        return cls_pred, mask_pred, attn_mask, emb_sigma
+
+    def reparam_trick(self, emb_mu, emb_sigma2):
+        """
+        emb_mu:     ([N, Q, C])
+        emb_sigma2:  ([N, Q, 1])
+        return:     ([m * N, Q, C])
+        """
+        N, Q, C = emb_mu.shape
+        emb_mu_ext = emb_mu.expand(N*self.max_t, Q, C)                # ([m * N, Q, C])
+        emb_sigma = emb_sigma2 * 0.5                                           # ([N, Q, 1])
+        emb_sigma_ext = emb_sigma.expand(N*self.max_t, Q, 1)         # ([m * N, Q, 1])
+        norm_v = torch.randn_like(emb_mu_ext)                                  # ([m * N, Q, C])
+        emb_mu_sto = emb_mu_ext + norm_v * emb_sigma_ext   # ([m * N, Q, C])
+        return emb_mu_sto
 
     def preprocess_gt(self, gt_occ, img_metas):
         
@@ -556,13 +622,13 @@ class Mask2FormerOccHead(MaskFormerHead):
         self.get_sampling_weights()
         
         # forward
-        all_cls_scores, all_mask_preds = self(voxel_feats, img_metas)
+        all_cls_scores, all_mask_preds, all_sigma = self(voxel_feats, img_metas)
         
         # preprocess ground truth
         gt_labels, gt_masks = self.preprocess_gt(gt_occ, img_metas)
 
         # loss
-        losses = self.loss(all_cls_scores, all_mask_preds, gt_labels, gt_masks, img_metas)
+        losses = self.loss(all_cls_scores, all_mask_preds, gt_labels, gt_masks, all_sigma, img_metas)
         
         return losses
 
@@ -621,11 +687,13 @@ class Mask2FormerOccHead(MaskFormerHead):
         ''' directly deocde the learnable queries, as simple proposals '''
         cls_pred_list = []
         mask_pred_list = []
-        cls_pred, mask_pred, attn_mask = self.forward_head(query_feat, 
+        sigma_list = []
+        cls_pred, mask_pred, attn_mask, sigma = self.forward_head(query_feat, 
                     mask_features, multi_scale_memorys[0].shape[-3:])
-    
+
         cls_pred_list.append(cls_pred)
         mask_pred_list.append(mask_pred)
+        sigma_list.append(sigma)
 
         for i in range(self.num_transformer_decoder_layers):
             level_idx = i % self.num_transformer_feat_level
@@ -648,12 +716,13 @@ class Mask2FormerOccHead(MaskFormerHead):
                 query_key_padding_mask=None,
                 key_padding_mask=None)
             
-            cls_pred, mask_pred, attn_mask = self.forward_head(
+            cls_pred, mask_pred, attn_mask, sigma = self.forward_head(
                 query_feat, mask_features, 
                 multi_scale_memorys[(i + 1) % self.num_transformer_feat_level].shape[-3:])
 
             cls_pred_list.append(cls_pred)
             mask_pred_list.append(mask_pred)
+            sigma_list.append(sigma)
         
         '''
         Returns:
@@ -668,7 +737,7 @@ class Mask2FormerOccHead(MaskFormerHead):
                  X, Y, Z).
         '''
         
-        return cls_pred_list, mask_pred_list
+        return cls_pred_list, mask_pred_list, sigma_list
 
     def format_results(self, mask_cls_results, mask_pred_results):
         mask_cls = F.softmax(mask_cls_results, dim=-1)[..., :-1]

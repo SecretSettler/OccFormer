@@ -245,6 +245,18 @@ def get_uncertain_point_coords_3d_with_frequency(
     
     return point_indices, point_coords
 
+def get_point_coords_3d_with_frequency(
+    gt_labels_list, gt_masks_list, sample_weights, num_points,
+    oversample_ratio, importance_sample_ratio):
+    assert oversample_ratio >= 1
+    assert 0 <= importance_sample_ratio <= 1
+    num_sampled = int(num_points * oversample_ratio)
+    
+    point_indices, point_coords = batch_sample_valid_coords_with_frequencies(
+        num_sampled, gt_labels_list, gt_masks_list, sample_weights,
+    )
+    return point_indices, point_coords
+
 def filter_scores_and_topk(scores, score_thr, topk, results=None):
     """Filter results using score threshold and topk candidates.
     Args:
